@@ -12,7 +12,7 @@ from yunchang.comm.all_to_all import SeqAllToAll4D
 
 from xfuser.logger import init_logger
 
-
+from sageattention import sageattn
 logger = init_logger(__name__)
 
 
@@ -159,24 +159,23 @@ class xFuserLongContextAttention(LongContextAttention):
             value_layer = SeqAllToAll4D.apply(
                 self.ulysses_pg, value, self.scatter_idx, self.gather_idx
             )
+        key_value_layer = torch.cat([key_layer, value_layer], dim = 0)
+        joint_tensor_key_value = torch.cat((joint_tensor_key, joint_tensor_value), dim=0)
+        b, s, n, d = key_value_layer.shape
+        kv_full = torch.empty([torch.distributed.get_world_size(self.ring_pg), b, s, n, d], dtype=query_layer.dtype, device=query_layer.device)
+        torch.distributed.all_gather_into_tensor(kv_full, key_value_layer, group=self.ring_pg)
 
-        out = self.ring_attn_fn(
+        joint_tensor_key_value = joint_tensor_key_value.transpose(1, 2)
+        kv_full = kv_full.permute(1, 3, 0, 2, 4).reshape(b, n, -1, d)
+        kv_full = torch.cat((kv_full, joint_tensor_key_value), dim=2)
+        query_layer = query_layer.transpose(1, 2)
+        key_layer, value_layer = kv_full.chunk(2, dim=0)
+        out = sageattn(
             query_layer,
             key_layer,
             value_layer,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=return_attn_probs,
-            group=self.ring_pg,
-            attn_type=self.attn_type,
-            attn_layer=attn if self.use_kv_cache else None,
-            joint_tensor_key=joint_tensor_key,
-            joint_tensor_value=joint_tensor_value,
-            joint_strategy=joint_strategy,
+            tensor_layout = "HND",
+            sm_scale=softmax_scale
         )
 
         if type(out) == tuple:
